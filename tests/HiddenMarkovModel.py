@@ -1,95 +1,13 @@
-from __future__ import annotations
+""" source: https://github.com/geeky-bit/Tensorflow-HiddenMarkovModel-Baum_Welch-Viterbi-forward_backward-algo/blob/master/HiddenMarkovModel.py"""
 
-from tensorflow.keras.layers import Layer
-import numpy as np
-from tensorflow import math as tfmath
+from __future__ import print_function
 import tensorflow as tf
+import numpy as np
 
-from .utils import cents2freq
+__author__ = "geeky"
 
 
-class ToHertzLayer(Layer):
-    """Classifer output to Hertz conversion layer
-
-    Args:
-        threshold (float): voicing threshold (0,1)
-        cmin (float): minimum ouput frequency in cents
-        cmax (float): maximum ouput frequency in cents
-        nb_average (int, optional): _description_. Defaults to 9.
-        fref (float, optional): _description_. Defaults to 10.0.
-        name (str | None, optional): _description_. Defaults to None.
-    """
-
-    def __init__(
-        self,
-        threshold: float,
-        cmin: float,
-        cmax: float,
-        nb_average: int = 9,
-        fref: float = 10.0,
-        name: str | None = None,
-    ):
-        super().__init__(trainable=False, name=name)
-
-        self.threshold = threshold
-
-        # the bin number-to-cents bin_freqs
-        self.cmin = tf.constant(cmin, tf.dtypes.float32)
-        self.cmax = tf.constant(cmax, tf.dtypes.float32)
-        self.fref = tf.constant(fref, tf.dtypes.float32)
-
-        self.index_delta = tf.reshape(tf.range(nb_average), (1, 1, -1))
-        self.offset = nb_average // 2
-
-        self.bin_freqs: tf.Tensor
-        self.start_max: tf.dtypes.int32
-        self.built: bool
-
-    def build(self, input_shape):
-        ndim = len(input_shape)
-        if ndim != 3:
-            raise ValueError(
-                "ToHertzLayer expects its input to be 3D Tensor (batch_shape, steps, activation_levels)"
-            )
-        self.bin_freqs = cents2freq(
-            tf.reshape(
-                tf.linspace(self.cmin, self.cmax, input_shape[-1]),
-                (1, 1, -1),
-            ),
-            self.fref,
-        )
-        self.start_max = input_shape[-1] - self.index_delta.shape[-1]
-        self.built = True
-
-    def call(self, inputs):
-
-        # peak index
-        center = tfmath.argmax(inputs, axis=-1, output_type=tf.dtypes.int32)
-        shape = tf.shape(inputs)
-        start = tf.reshape(
-            tfmath.minimum(self.start_max, tfmath.maximum(0, center - self.offset)),
-            [shape[0], shape[1], 1],
-        )
-        indices = start + self.index_delta
-
-        # weighted mean of 9 values
-        weights = tf.experimental.numpy.take_along_axis(inputs, indices, axis=2)
-        c = tf.experimental.numpy.take_along_axis(self.bin_freqs, indices, axis=2)
-
-        product_sum = tfmath.reduce_sum(c * weights, axis=2)
-        weight_sum = tfmath.reduce_sum(weights, axis=2)
-        f = product_sum / weight_sum
-
-        confidence = tfmath.reduce_max(inputs, axis=-1)  # keepdims?
-
-        # voice detector
-        voiced = confidence > self.threshold
-        f = tf.where(voiced, f, 0.0)
-        confidence = tf.where(voiced, confidence, 1.0 - confidence)
-
-        return tf.stack([f, confidence], axis=2)
-
-class HiddenMarkovModel(Layer):
+class HiddenMarkovModel(object):
     """
     This is the Hidden Markov Model Class
      -----------
@@ -100,128 +18,37 @@ class HiddenMarkovModel(Layer):
      - T0: Initial state probabilities of size S.
     """
 
-    def __init__(
-        self,
-        smoothing_factor=12,
-        epsilon=0.001,
-        maxStep=10,
-        name: str | None = None,  # layer name
-    ):
-        super().__init__(trainable=False, name=name)
+    def __init__(self, T, E, T0, epsilon=0.001, maxStep=10):
 
-        self.smoothing_factor = smoothing_factor
+        with tf.name_scope("Inital_Parameters"):
+            with tf.name_scope("Scalar_constants"):
 
-        # Max number of iteration
-        self.maxStep = maxStep
+                # Max number of iteration
+                self.maxStep = maxStep
 
-        # convergence criteria
-        self.epsilon = epsilon
+                # convergence criteria
+                self.epsilon = epsilon
 
-        # Number of possible states
-        self.S:int
+                # Number of possible states
+                self.S = T.shape[0]
 
-        # Number of possible observations
-        self.O:int
+                # Number of possible observations
+                self.O = E.shape[0]
 
-        self.prob_state_1 = []
+                self.prob_state_1 = []
 
-        # Emission probability
-        self.E: tf.Variable
+            with tf.name_scope("Model_Parameters"):
 
-        # Transition matrix
-        self.T: tf.Variable
+                # Emission probability
+                self.E = tf.Variable(E, dtype=tf.float64, name="emission_matrix")
 
-        # Initial state vector
-        self.T0: tf.Variable
+                # Transition matrix
+                self.T = tf.Variable(T, dtype=tf.float64, name="transition_matrix")
 
-    def build(self, input_shape):
-        
-        vecSize = input_shape[-1]
-
-        # uniform prior on the starting pitch
-        starting = np.ones(vecSize) / vecSize
-
-        # transition probabilities inducing continuous pitch
-        xx, yy = np.meshgrid(range(vecSize), range(vecSize))
-        transition = np.maximum(self.smoothing_factor - abs(xx - yy), 0)
-        transition = transition / np.sum(transition, axis=1)[:, None]
-
-        # emission probability = fixed probability for self, evenly distribute the
-        # others
-        self_emission = 0.1
-        emission = np.eye(vecSize) * self_emission + np.ones(shape=(vecSize, vecSize)) * (
-            (1 - self_emission) / vecSize
-
-        # Emission probability
-        self.E = tf.Variable(E, dtype=tf.float64, name="emission_matrix")
-
-        # Transition matrix
-        self.T = tf.Variable(T, dtype=tf.float64, name="transition_matrix")
-
-        # Initial state vector
-        self.T0 = tf.Variable(
-            tf.constant(T0, dtype=tf.float64, name="inital_state_vector")
-        )
-        
-        # Number of possible states
-        self.S = T.shape[0]
-
-        # Number of possible observations
-        self.O = E.shape[0]
-
-    def call(self, obs_seq): 
-            # length of observed sequence
-        self.N = len(obs_seq)
-
-        # shape path Variables
-        shape = [self.N, self.S]
-
-        # observed sequence
-        x = tf.constant(obs_seq, dtype=tf.int32, name="observation_sequence")
-
-        # Initialize variables
-        pathStates, pathScores, states_seq = self.initialize_viterbi_variables(shape)
-
-        # log probability of emission sequence
-        obs_prob_seq = tf.math.log(tf.gather(self.E, x))
-        obs_prob_list = tf.split(obs_prob_seq, self.N, 0)
-
-        # initialize with state starting log-priors
-        pathScores = tf.compat.v1.scatter_update(
-            pathScores, 0, tf.math.log(self.T0) + tf.squeeze(obs_prob_list[0])
-        )
-
-        for step, obs_prob in enumerate(obs_prob_list[1:]):
-
-            # propagate state belief
-            belief = self.belief_propagation(pathScores[step, :])
-
-            # the inferred state by maximizing global function
-            # and update state and score matrices
-            pathStates = tf.compat.v1.scatter_update(
-                pathStates, step + 1, tf.argmax(belief, 0)
-            )
-            pathScores = tf.compat.v1.scatter_update(
-                pathScores,
-                step + 1,
-                tf.reduce_max(belief, 0) + tf.squeeze(obs_prob),
-            )
-
-            # infer most likely last state
-            states_seq = tf.compat.v1.scatter_update(
-                states_seq, self.N - 1, tf.argmax(pathScores[self.N - 1, :], 0)
-            )
-
-        for step in range(self.N - 1, 0, -1):
-            # for every timestep retrieve inferred state
-            state = states_seq[step]
-            idx = tf.reshape(tf.stack([step, state]), [1, -1])
-            state_prob = tf.gather_nd(pathStates, idx)
-            states_seq = tf.compat.v1.scatter_update(
-                states_seq, step - 1, state_prob[0]
-            )
-
-        return states_seq, tf.exp(pathScores)  # turn scores back to probabilities
+                # Initial state vector
+                self.T0 = tf.Variable(
+                    tf.constant(T0, dtype=tf.float64, name="inital_state_vector")
+                )
 
     def initialize_viterbi_variables(self, shape):
 
@@ -237,6 +64,70 @@ class HiddenMarkovModel(Layer):
         scores_reshape = tf.reshape(scores, (-1, 1))
         return tf.add(scores_reshape, tf.math.log(self.T))
 
+    def viterbi_inference(self, obs_seq):
+
+        # length of observed sequence
+        self.N = len(obs_seq)
+
+        # shape path Variables
+        shape = [self.N, self.S]
+
+        # observed sequence
+        x = tf.constant(obs_seq, dtype=tf.int32, name="observation_sequence")
+
+        with tf.name_scope("Init_viterbi_variables"):
+            # Initialize variables
+            pathStates, pathScores, states_seq = self.initialize_viterbi_variables(
+                shape
+            )
+
+        with tf.name_scope("Emission_seq_"):
+            # log probability of emission sequence
+            obs_prob_seq = tf.math.log(tf.gather(self.E, x))
+            obs_prob_list = tf.split(obs_prob_seq, self.N, 0)
+
+        with tf.name_scope("Starting_log-priors"):
+            # initialize with state starting log-priors
+            pathScores = tf.compat.v1.scatter_update(
+                pathScores, 0, tf.math.log(self.T0) + tf.squeeze(obs_prob_list[0])
+            )
+
+        with tf.name_scope("Belief_Propagation"):
+            for step, obs_prob in enumerate(obs_prob_list[1:]):
+
+                with tf.name_scope("Belief_Propagation_step_%s" % step):
+                    # propagate state belief
+                    belief = self.belief_propagation(pathScores[step, :])
+
+                    # the inferred state by maximizing global function
+                    # and update state and score matrices
+                    pathStates = tf.compat.v1.scatter_update(
+                        pathStates, step + 1, tf.argmax(belief, 0)
+                    )
+                    pathScores = tf.compat.v1.scatter_update(
+                        pathScores,
+                        step + 1,
+                        tf.reduce_max(belief, 0) + tf.squeeze(obs_prob),
+                    )
+
+            with tf.name_scope("Max_Likelyhood_update"):
+                # infer most likely last state
+                states_seq = tf.compat.v1.scatter_update(
+                    states_seq, self.N - 1, tf.argmax(pathScores[self.N - 1, :], 0)
+                )
+
+        with tf.name_scope("Backtrack"):
+            for step in range(self.N - 1, 0, -1):
+                with tf.name_scope("Back_track_step_%s" % step):
+                    # for every timestep retrieve inferred state
+                    state = states_seq[step]
+                    idx = tf.reshape(tf.stack([step, state]), [1, -1])
+                    state_prob = tf.gather_nd(pathStates, idx)
+                    states_seq = tf.compat.v1.scatter_update(
+                        states_seq, step - 1, state_prob[0]
+                    )
+
+        return states_seq, tf.exp(pathScores)  # turn scores back to probabilities
 
     def run_viterbi(self, obs_seq, summary=False):
 
